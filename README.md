@@ -2,6 +2,8 @@
 
 A decentralized, real-time real estate marketplace application built with HTML, TailwindCSS, and GenosDB in a single file. It demonstrates the power of Peer-to-Peer (P2P) architecture applied to property management, featuring granular access control, biometric authentication, and live state synchronization without a traditional backend.
 
+![dProp App Screenshot](docs/screenshot.jpg) 
+
 ## Features
 
   - **Real-time State Synchronization**: Property status changes (Available ➔ Reserved ➔ Sold) update instantly across all connected peers via GenosDB's reactive streams.
