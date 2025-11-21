@@ -6,28 +6,31 @@ A decentralized, real-time real estate marketplace application built with HTML, 
 
 ## Features
 
-  - **Real-time State Synchronization**: Property status changes (Available ➔ Reserved ➔ Sold) update instantly across all connected peers via GenosDB's reactive streams.
+  - **Real-time State Synchronization**: Property status changes (Available ➔ Reserved ➔ Sold) and content edits update instantly across all connected peers via GenosDB's reactive streams.
+  - **Collaborative Ownership (ACLs)**:
+      - **Share Access**: Owners can grant 'write' permissions to other users via their Ethereum address, enabling collaborative management of specific properties.
+      - **Granular Permissions**: The UI automatically adapts to show edit controls only to owners and authorized collaborators.
   - **Advanced Identity & Security**:
       - **WebAuthn Integration**: Passwordless login using biometrics (fingerprint/FaceID) or security keys.
       - **Mnemonic Recovery**: BIP39-style recovery phrases for account restoration.
-      - **RBAC & ACLs**: Granular permission system where only the property owner can modify its status, secured by cryptographic signatures.
+      - **RBAC & ACLs**: Robust security where data integrity is protected by cryptographic signatures and node-level access control lists.
+  - **Full Lifecycle Management**:
+      - **Atomic Editing**: Users can update property details (price, description, images) reusing the publishing form. Updates preserve the original creation date and ownership metadata.
   - **Interactive Map & Geolocation**:
       - Integration with **Leaflet** for visualizing properties on a map.
       - Real-time markers update dynamically as properties are added or filtered.
   - **Rich Filtering & Search**:
       - Filter by operation (Rent/Sale), property type, price range, and location.
       - Complex querying powered by GenosDB's query engine.
-  - **Optimized Performance**:
-      - **Cursor-based Pagination**: Efficient loading of large datasets using `$after` cursors.
+  - **Modern UI/UX with Dark Mode**:
+      - **Dark Theme**: Fully integrated dark mode with persistence (localStorage) and auto-detection.
+      - **Smart Map Styling**: Map tiles automatically dim and invert in dark mode for visual comfort.
       - **Reactive DOM Updates**: Surgical DOM manipulation for smooth UI transitions without full page reloads.
-  - **Modern UI/UX**:
-      - Built with **TailwindCSS** for a sleek, responsive design.
-      - Visual feedback for status changes and interactive states.
 
 ## Advantages of Using GenosDB (`gdb`) in Real Estate
 
   - **Built-in Security Manager (SM)**: Handles complex identity management and cryptographic signing out of the box, critical for property ownership verification.
-  - **Access Control Lists (ACLs)**: The `db.sm.acls` module allows for node-level permissions, ensuring that while data is public/shared, write access is strictly restricted to the asset owner.
+  - **Access Control Lists (ACLs)**: The `db.sm.acls` module allows for node-level permissions. It supports `grant` and `revoke` operations, ensuring that write access is strictly restricted to the asset owner and explicitly authorized peers.
   - **Reactive `map()` Method**: Enables the application to listen for specific query changes (e.g., "Show me apartments under $200k") and update the UI in real-time as peers publish or modify listings.
   - **Schemaless & Flexible**: Easily stores diverse property data (JSON) including metadata, base64 images, and geolocation coordinates.
   - **Serverless Architecture**: The application runs entirely in the browser. GenosDB handles the data distribution and synchronization between peers, eliminating the need for a central API server for the core logic.
@@ -41,7 +44,7 @@ A decentralized, real-time real estate marketplace application built with HTML, 
   - **GenosDB (`gdb`)**:
       - **RTC Module**: For P2P networking.
       - **Security Manager**: For Auth & RBAC.
-      - **ACLs Module**: For ownership enforcement.
+      - **ACLs Module**: For ownership enforcement and sharing.
 
 ## How to Use
 
@@ -58,21 +61,24 @@ A decentralized, real-time real estate marketplace application built with HTML, 
       * Navigate to `http://localhost:3000`.
 4.  **Experience the Flow**:
       * **Register**: Create a Digital Identity and protect it with a Passkey.
-      * **Publish**: Post a new property (automatically signed and owner-stamped).
-      * **Simulate P2P**: Open a second browser window (Incognito or a different browser). Log in as a different user.
-      * **Real-time Test**: On the first window, change a property status to "Sold". Watch it update instantly on the second window.
+      * **Publish**: Post a new property.
+      * **Dark Mode**: Toggle the moon/sun icon in the navbar to switch themes.
+      * **Collaborate**:
+        1.  Open a second browser (Incognito). Log in as User B. Copy User B's address.
+        2.  As Owner (User A), click the "Share" (User+) icon on your property. Paste User B's address.
+        3.  User B will instantly see "Edit" and "Status" controls appear on that property.
+      * **Real-time Edit**: Have User B change the price or status to "Sold". Watch it update instantly on User A's screen.
 
 ## Project Structure
 
   - `index.html`: This is a **single-file application**. It contains:
       - HTML Structure (Layout, Modals, Cards).
-      - Tailwind Classes (Styling).
-      - Application Logic (GenosDB initialization, Auth flow, Map rendering, and Reactive listeners).
+      - Tailwind Classes (Styling & Dark Mode config).
+      - Application Logic (GenosDB initialization, Auth flow, ACL sharing logic, Map rendering, and Reactive listeners).
 
 ## Demo
 
 [dProp Demo](https://estebanrfp.github.io/dProp/) Powered by [GenosDB (GDB)](https://github.com/estebanrfp/gdb)
-
 
 ## License
 
