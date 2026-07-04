@@ -1,6 +1,19 @@
 # dProp | Real-Time P2P Real Estate Proof of Concept powered by GenosDB
 
-A decentralized, real-time real estate marketplace application built with HTML, TailwindCSS, and GenosDB in a single file. It demonstrates the power of Peer-to-Peer (P2P) architecture applied to property management, featuring granular access control, biometric authentication, and live state synchronization without a traditional backend.
+A decentralized, real-time real estate marketplace built with plain HTML, CSS and JavaScript on GenosDB — no frameworks, no build step. It demonstrates P2P architecture applied to property management: **rule-based governance** (roles are earned, not granted), granular access control with shareable permissions, biometric authentication, and live state synchronization without a traditional backend.
+
+It follows the [GenosDB Design Guide](https://github.com/estebanrfp/gdb/blob/main/docs/genosdb-design-guide.md) — including the sanctioned **theme toggle** pattern: the light/dark switch swaps design tokens only.
+
+## The role ladder (Governance)
+
+| Role | Capabilities | How it is earned |
+|---|---|---|
+| `guest` | browse & sync | You start here |
+| `agent` | + publish and edit own listings | ~10 s after signing in |
+| `admin` | + delete any listing (moderation) | 3 listings published |
+| `superadmin` | signs role promotions | Demo identity (one click) |
+
+Promotions are signed automatically by the governance engine while a superadmin is online — press **🛡️ Demo superadmin** in one browser and watch other identities climb.
 
 ![dProp App Screenshot](docs/screenshot.jpg) 
 

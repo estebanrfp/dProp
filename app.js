@@ -1,126 +1,252 @@
+// dProp — a decentralized, real-time P2P real-estate marketplace on GenosDB.
+//
+// What this example demonstrates, end to end:
+//   • Zero-trust + Governance: visitors are read-only guests; public rules
+//     promote them to `agent` (can publish) and `admin` (moderation) while a
+//     superadmin is online to sign each promotion. No server involved.
+//   • ACLs with collaboration: every property is owned by its creator, and
+//     owners can GRANT write access to other addresses (Share Access).
+//   • Live queries: filters, cursor pagination and realtime updates from one
+//     db.map subscription; a Leaflet map mirrors the same data.
+//   • The GenosDB Design Guide patterns: design tokens, dark default with a
+//     sanctioned theme toggle, identity in a centered <dialog>, session
+//     top-right as `0x… [role]`, toasts instead of alerts.
 import { gdb } from "https://cdn.jsdelivr.net/npm/genosdb@latest/dist/index.min.js"
 
-// --- STATE & CONFIG ---
-let db
-let currentCursor = null
-let activeSubscription = null
+// ============================== Configuration ==============================
+
+const DB_NAME = "dprop" // database name = P2P room name
+
+// Demo superadmin — SHOWCASE ONLY. Its mnemonic is public so any visitor can
+// run the governance engine. Replace with your own address (and keep the
+// phrase private) for a real deployment.
+const DEMO_SUPERADMIN = {
+  address: "0xbfDe0eCEC5332Fd86D2570085571D6051Df098dA",
+  mnemonic: "panic now afford carbon donate lecture drift excite collect essay stuff prosper",
+}
+
+// Custom RBAC roles for a marketplace. Writing must be EARNED (zero-trust).
+const ROLES = {
+  superadmin: { can: ["assignRole"], inherits: ["admin"] }, // signs promotions
+  admin: { can: ["delete", "deleteAny"], inherits: ["agent"] }, // moderation
+  agent: { can: ["write", "link", "sync"], inherits: ["guest"] }, // publishes listings
+  guest: { can: ["read", "sync"] }, // browses only
+}
+
+// Public advancement rules, evaluated against `user:<address>` nodes while a
+// superadmin is online. Last-match-wins; low thresholds so a visitor sees the
+// full climb in minutes.
+const MEMBER = { $in: ["agent", "admin"] }
+const GOVERNANCE_RULES = [
+  { if: { role: "guest" }, offsetTimestamp: 10000, then: { assignRole: "agent" } }, // onboarding gate
+  { if: { role: MEMBER }, then: { assignRole: "agent" } }, // floor
+  { if: { role: MEMBER, listingCount: { $gte: 3 } }, then: { assignRole: "admin" } }, // climb
+]
+
+// ================================ Database =================================
+
+const db = await gdb(DB_NAME, {
+  rtc: true, // required by the Security Manager
+  sm: {
+    superAdmins: [DEMO_SUPERADMIN.address],
+    customRoles: ROLES,
+    governanceRules: GOVERNANCE_RULES,
+    acls: true, // node-level ownership + grantable permissions
+  },
+})
+globalThis.db = db // console handle (matches the official examples)
+
+// ================================ Helpers ==================================
+
+const $ = (id) => document.getElementById(id)
+
+/** Escape untrusted text before inserting it into HTML (P2P peers write it). */
+const esc = (s) => String(s ?? "").replace(/[&<>"']/g, (c) =>
+  ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]))
+
+const toast = (msg, isError = false) => {
+  const el = $("toast")
+  el.textContent = msg
+  el.className = `toast show${isError ? " error" : ""}`
+  clearTimeout(toast._t)
+  toast._t = setTimeout(() => (el.className = "toast"), 3200)
+}
+
+const CURRENCY = { USD: "$", EUR: "€", GBP: "£" }
+const PLACEHOLDER_IMG = "data:image/svg+xml;charset=UTF-8,%3Csvg%20xmlns%3D%22http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%22%20width%3D%22500%22%20height%3D%22300%22%3E%3Crect%20width%3D%22500%22%20height%3D%22300%22%20fill%3D%22%231c2026%22%2F%3E%3Ctext%20x%3D%22250%22%20y%3D%22155%22%20fill%3D%22%235c6570%22%20text-anchor%3D%22middle%22%20font-family%3D%22sans-serif%22%3ENo%20image%3C%2Ftext%3E%3C%2Fsvg%3E"
+
+// ============================== Theme toggle ===============================
+// The Design Guide's sanctioned pattern: one icon button, [data-theme] swaps
+// TOKENS ONLY, localStorage persists, prefers-color-scheme seeds first visit.
+
+const applyTheme = (t) => {
+  document.documentElement.dataset.theme = t
+  localStorage.theme = t
+  $("themeBtn").textContent = t === "dark" ? "☀️" : "🌙" // icon = mode you'll switch to
+  if (mapInstance) setTimeout(() => mapInstance.invalidateSize(), 50)
+}
+$("themeBtn").onclick = () =>
+  applyTheme(document.documentElement.dataset.theme === "dark" ? "light" : "dark")
+
+// =============================== Identity ==================================
+// SM state callback = single source of truth. We watch the `user:<address>`
+// node so governance promotions update the UI live.
+
+let myAddress = null
+let myRole = null
+let unsubRole = null
+
+const can = (permission) => {
+  let role = myRole
+  while (role && ROLES[role]) {
+    if (ROLES[role].can.includes(permission)) return true
+    role = ROLES[role].inherits?.[0]
+  }
+  return false
+}
+
+const applyPermissionsToUI = () => {
+  $("publishBtn").style.display = can("write") ? "block" : "none"
+  $("publishHint").style.display = myAddress && !can("write") ? "block" : "none"
+}
+
+db.sm.setSecurityStateChangeCallback((state) => {
+  if (state.isActive) {
+    myAddress = state.activeAddress
+    $("identityModal").close()
+    $("identityPanel").style.display = "none"
+    $("sessionBar").style.display = "flex"
+    $("whoami").textContent = state.abbrAddr
+    watchMyRole()
+  } else {
+    unsubRole?.(); unsubRole = null
+    myAddress = myRole = null
+    $("sessionBar").style.display = "none"
+    $("identityPanel").style.display = "block"
+    $("mnemonicBox").readOnly = false
+    $("generateBtn").style.display = "inline-block"
+    $("protectBtn").style.display = "none"
+    $("webauthnLoginBtn").style.display = db.sm.hasExistingWebAuthnRegistration() ? "inline-block" : "none"
+    queueMicrotask(() => { applyPermissionsToUI(); performSearch(false) })
+  }
+})
+
+const watchMyRole = async () => {
+  unsubRole?.()
+  const { unsubscribe } = await db.get(`user:${myAddress}`, (node) => {
+    const next = node?.value?.role ?? "guest"
+    if (next !== myRole) {
+      myRole = next
+      $("myRole").textContent = myRole
+      $("myRole").dataset.role = myRole
+      applyPermissionsToUI()
+      performSearch(false) // ownership/moderation affordances may change
+    }
+  })
+  unsubRole = unsubscribe
+}
+
+// --- Identity modal (three-phase state machine, see the Design Guide) ---
+
+$("openLoginBtn").onclick = () => $("identityModal").showModal()
+$("closeModalBtn").onclick = () => $("identityModal").close()
+$("identityModal").onclick = (e) => { if (e.target === $("identityModal")) $("identityModal").close() }
+
+$("generateBtn").onclick = async () => {
+  const identity = await db.sm.startNewUserRegistration()
+  if (!identity) return toast("Could not generate an identity", true)
+  const box = $("mnemonicBox")
+  box.value = identity.mnemonic
+  box.readOnly = true // protect the phrase until it is saved
+  $("generateBtn").style.display = "none" // one identity at a time
+  $("protectBtn").style.display = "inline-block"
+  toast("SAVE THIS PHRASE — it is your only way back into this identity")
+}
+
+$("copyBtn").onclick = async () => {
+  const phrase = $("mnemonicBox").value.trim()
+  if (!phrase) return
+  await navigator.clipboard.writeText(phrase)
+  toast("Phrase copied to clipboard")
+}
+
+$("loginBtn").onclick = async () => {
+  const phrase = $("mnemonicBox").value.trim()
+  if (!phrase) return toast("Paste (or generate) a mnemonic first", true)
+  const identity = await db.sm.loginOrRecoverUserWithMnemonic(phrase)
+  identity ? toast(`Welcome ${db.sm.abbrAddr(identity.address)}`) : toast("Login failed", true)
+}
+
+$("protectBtn").onclick = async () => {
+  const address = await db.sm.protectCurrentIdentityWithWebAuthn()
+  address ? toast("Identity protected with a passkey") : toast("Passkey protection failed (HTTPS required)", true)
+}
+
+$("webauthnLoginBtn").onclick = async () => {
+  const address = await db.sm.loginCurrentUserWithWebAuthn()
+  if (!address) toast("Passkey login failed", true)
+}
+
+// One click makes THIS browser the superadmin: the governance engine runs
+// here and signs promotions for every guest in the room.
+$("superadminBtn").onclick = () => db.sm.loginOrRecoverUserWithMnemonic(DEMO_SUPERADMIN.mnemonic)
+
+$("logoutBtn").onclick = () => db.sm.clearSecurity()
+
+// ================================== Map ====================================
+
 let mapInstance = null
 let mapMarkers = {}
-let userCache = {} // Simple cache for permissions check context
 
-const APP_ROLES = {
-  admin: { can: ["deleteAny"], inherits: ["user"] },
-  user: { can: ["write", "link"], inherits: ["guest"] },
-  guest: { can: ["read", "sync", "write"] }, // Guests can read and receive syncs
-}
-
-// --- INIT ---
-async function initApp() {
-  initTheme() // Dark mode check
-
-  db = await gdb("dprop-v2-acls", {
-    rtc: true,
-    sm: {
-      superAdmins: ["0x0000000000000000000000000000000000000000"],
-      customRoles: APP_ROLES,
-      acls: true, // Enables node-level permissions
-    },
-  })
-
-  db.sm.setSecurityStateChangeCallback(updateAuthUI)
-  initMap()
-  performSearch()
-}
-
-// --- THEME LOGIC ---
-window.initTheme = () => {
-  if (
-    localStorage.getItem("theme") === "dark" ||
-    (!("theme" in localStorage) &&
-      window.matchMedia("(prefers-color-scheme: dark)").matches)
-  ) {
-    document.documentElement.classList.add("dark")
-  } else {
-    document.documentElement.classList.remove("dark")
-  }
-}
-
-window.toggleTheme = () => {
-  if (document.documentElement.classList.contains("dark")) {
-    document.documentElement.classList.remove("dark")
-    localStorage.setItem("theme", "light")
-  } else {
-    document.documentElement.classList.add("dark")
-    localStorage.setItem("theme", "dark")
-  }
-}
-
-// --- MAP LOGIC ---
-function initMap() {
+const initMap = () => {
   mapInstance = L.map("map-container").setView([51.505, -0.09], 4)
-  // Add custom class for dark mode filtering
   L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", {
     attribution: "&copy; OSM",
-    className: "map-tiles",
+    className: "map-tiles", // dark mode dims/inverts tiles via CSS tokens
   }).addTo(mapInstance)
 }
 
-function updateMapMarker(p) {
+const STATUS_COLOR = { available: "#34c77b", reserved: "#f5a623", sold: "#ef5350" }
+
+const updateMapMarker = (p) => {
   if (!p.lat || !p.lng) return
   if (p.status === "deleted") {
-    if (mapMarkers[p.id]) {
-      mapInstance.removeLayer(mapMarkers[p.id])
-      delete mapMarkers[p.id]
-    }
+    if (mapMarkers[p.id]) { mapInstance.removeLayer(mapMarkers[p.id]); delete mapMarkers[p.id] }
     return
   }
-
-  const colors = { available: "#4ade80", reserved: "#facc15", sold: "#f87171" }
-  const markerColor = colors[p.status] || "#94a3b8"
-
-  // Simple custom marker div
+  const color = STATUS_COLOR[p.status] || "#9aa3ad"
   const icon = L.divIcon({
     className: "custom-marker",
-    html: `<div style="background-color: ${markerColor}; width: 14px; height: 14px; border-radius: 50%; border: 2px solid white; box-shadow: 0 2px 4px rgba(0,0,0,0.3);"></div>`,
+    html: `<div class="marker-dot" style="background-color:${color}"></div>`,
     iconSize: [14, 14],
   })
-
   const content = `
-                <div class="text-center min-w-[150px]">
-                    <img src="${
-                      p.imgUrl || "https://via.placeholder.com/150"
-                    }" class="w-full h-24 object-cover rounded mb-2">
-                    <strong class="block text-gray-900">${p.title}</strong>
-                    <span class="text-xs font-bold uppercase" style="color:${markerColor}">${
-    p.status
-  }</span>
-                </div>
-            `
-
-  if (mapMarkers[p.id]) {
-    mapMarkers[p.id]
-      .setLatLng([p.lat, p.lng])
-      .setPopupContent(content)
-      .setIcon(icon)
-  } else {
-    const m = L.marker([p.lat, p.lng], { icon })
-      .addTo(mapInstance)
-      .bindPopup(content)
-    mapMarkers[p.id] = m
-  }
+    <div class="map-popup">
+      <img src="${esc(p.imgUrl) || PLACEHOLDER_IMG}" alt="">
+      <strong>${esc(p.title)}</strong>
+      <span style="color:${color}">${esc(p.status)}</span>
+    </div>`
+  if (mapMarkers[p.id]) mapMarkers[p.id].setLatLng([p.lat, p.lng]).setPopupContent(content).setIcon(icon)
+  else mapMarkers[p.id] = L.marker([p.lat, p.lng], { icon }).addTo(mapInstance).bindPopup(content)
 }
 
-// --- CORE LOGIC ---
+// ========================= Live search & rendering =========================
+// One realtime subscription per search: filters build the query, the engine
+// owns ordering (createdAt desc) and the cursor window ($limit/$after).
+
+let currentCursor = null
+let activeSubscription = null
+
 async function performSearch(isLoadMore = false) {
   if (!isLoadMore) {
-    document.getElementById("property-grid").innerHTML = ""
+    $("property-grid").innerHTML = ""
     currentCursor = null
-    if (activeSubscription) activeSubscription()
+    activeSubscription?.()
     Object.values(mapMarkers).forEach((m) => mapInstance.removeLayer(m))
     mapMarkers = {}
   }
 
-  const fd = new FormData(document.getElementById("search-form"))
+  const fd = new FormData($("search-form"))
   const query = { type: "Property" }
   if (fd.get("operation")) query.operation = fd.get("operation")
   if (fd.get("type")) query.propertyType = fd.get("type")
@@ -132,453 +258,242 @@ async function performSearch(isLoadMore = false) {
   }
 
   const { unsubscribe, results } = await db.map(
-    {
-      query,
-      realtime: true,
-      $limit: 12,
-      $after: currentCursor,
-      order: "desc",
-      field: "createdAt",
-    },
-    ({ id, value, action }) => handleRealtimeUpdate(id, value, action)
+    { query, realtime: true, $limit: 12, $after: currentCursor, order: "desc", field: "createdAt" },
+    ({ id, value, action }) => handleRealtimeUpdate(id, value, action),
   )
-
   activeSubscription = unsubscribe
 
-  document.getElementById(
-    "results-count"
-  ).innerText = `${results.length} properties found`
-  document
-    .getElementById("btn-load-more")
-    .classList.toggle("hidden", results.length < 12)
+  $("results-count").textContent = `${results.length} properties found`
+  $("btn-load-more").style.display = results.length < 12 ? "none" : "inline-block"
   if (results.length > 0) currentCursor = results[results.length - 1].id
 }
 
 function handleRealtimeUpdate(id, value, action) {
-  const grid = document.getElementById("property-grid")
-  const cardId = `card-${id}`
-  const existingCard = document.getElementById(cardId)
+  const grid = $("property-grid")
+  const existing = document.getElementById(`card-${id}`)
 
-  if (action === "removed") {
-    if (existingCard) {
-      existingCard.style.opacity = "0"
-      setTimeout(() => existingCard.remove(), 300)
+  switch (action) {
+    case "removed": // deleted here or by a remote peer / moderator
+      if (existing) { existing.style.opacity = "0"; setTimeout(() => existing.remove(), 300) }
+      updateMapMarker({ id, status: "deleted" })
+      return
+    case "initial": // pre-existing listings, streamed once, already sorted
+      grid.appendChild(buildCard(id, value))
+      break
+    case "added": // a brand-new listing — newest by definition, enters on top
+      grid.prepend(buildCard(id, value))
+      break
+    case "updated": { // edits and status changes rebuild the card in place
+      const card = buildCard(id, value)
+      if (existing) { existing.replaceWith(card); card.classList.add("flash"); setTimeout(() => card.classList.remove("flash"), 900) }
+      else grid.prepend(card)
+      break
     }
-    updateMapMarker({ id, status: "deleted" })
-    return
   }
-
-  const p = { id, ...value }
-  updateMapMarker(p)
-
-  const cardHTML = createCardHTML(p)
-  const tempDiv = document.createElement("div")
-  tempDiv.innerHTML = cardHTML.trim()
-  const newEl = tempDiv.firstElementChild
-
-  if (existingCard) {
-    existingCard.replaceWith(newEl)
-    // Flash effect
-    newEl.classList.add("ring-2", "ring-indigo-400")
-    setTimeout(() => newEl.classList.remove("ring-2", "ring-indigo-400"), 1000)
-  } else {
-    if (action === "added" || action === "initial") grid.appendChild(newEl)
-  }
+  updateMapMarker({ id, ...value })
 }
 
-function createCardHTML(p) {
-  const currentUser = db.sm.getActiveEthAddress()
-
-  // PERMISSIONS LOGIC:
-  // 1. Owner: Created the node (p.owner === currentUser)
-  // 2. Collaborator: Explicitly granted 'write' in ACLs.
-  // Note: In a production list view, checking perms for every item via async call is heavy.
-  // P2P/GenosDB allows implicit check: if I can't write, the operation fails.
-  // For UI, we assume basic visibility. We show buttons if owner OR if known collaborator.
-  // To be robust, we'll try to check if 'collaborators' exists in value (if synced) or just show for owner.
-  // *Enhancement*: We'll assume if you are owner, you see Share/Edit.
-
-  const isOwner = currentUser && p.owner === currentUser
-
-  // We check if the current user is in the collaborators list stored in the node value
-  // (Assuming the App saves collaborators list to the node value when granting, see grantAccess function)
-  const isCollab = p.collaborators && p.collaborators[currentUser] === "write"
+function buildCard(id, p) {
+  const isOwner = myAddress && p.owner === myAddress
+  const isCollab = p.collaborators?.[myAddress] === "write" // Share Access grantee
   const canEdit = isOwner || isCollab
+  const canModerate = can("deleteAny") && !isOwner // admins clean up spam
 
-  const statusConfig = {
-    available: {
-      bg: "bg-green-100 text-green-800 dark:bg-green-900/30 dark:text-green-300",
-      icon: "fa-check",
-    },
-    reserved: {
-      bg: "bg-yellow-100 text-yellow-800 dark:bg-yellow-900/30 dark:text-yellow-300",
-      icon: "fa-clock",
-    },
-    sold: {
-      bg: "bg-red-100 text-red-800 dark:bg-red-900/30 dark:text-red-300",
-      icon: "fa-ban",
-    },
-  }
-  const st = statusConfig[p.status] || statusConfig["available"]
-  const cur = p.currency === "EUR" ? "€" : p.currency === "GBP" ? "£" : "$"
+  const cur = CURRENCY[p.currency] ?? "$"
+  const card = document.createElement("article")
+  card.id = `card-${id}`
+  card.className = "property-card"
+  card.innerHTML = `
+    <div class="card-media">
+      <img src="${esc(p.imgUrl) || PLACEHOLDER_IMG}" alt="${esc(p.title)}" loading="lazy"
+           onerror="this.src='${PLACEHOLDER_IMG}'">
+      <span class="status-tag" data-status="${esc(p.status)}">${esc(p.status)}</span>
+      <div class="card-tools">
+        ${isOwner ? `<button data-share title="Share Access">👥</button>` : ""}
+        ${canEdit ? `<button data-edit title="Edit details">✏️</button>` : ""}
+        ${(isOwner || canModerate) ? `<button data-delete title="${canModerate ? "Moderate: delete listing" : "Delete listing"}">🗑️</button>` : ""}
+      </div>
+    </div>
+    <div class="card-body">
+      <p class="card-kicker">${esc(p.propertyType)} · ${esc(p.operation)}</p>
+      <div class="card-title-row">
+        <h3 title="${esc(p.title)}">${esc(p.title)}</h3>
+        <strong class="card-price">${cur}${Number(p.price).toLocaleString()}</strong>
+      </div>
+      <p class="card-location">📍 ${esc(p.city)}, ${esc(p.country)}</p>
+      ${canEdit ? `
+      <div class="card-status-row">
+        <button data-status-btn="available">Available</button>
+        <button data-status-btn="reserved">Reserve</button>
+        <button data-status-btn="sold">Sold</button>
+      </div>` : `
+      <div class="card-meta-row">
+        <span>${new Date(p.createdAt).toLocaleDateString()}</span>
+        ${p.owner ? `<span class="owner-tag" title="Owner">${esc(db.sm.abbrAddr(p.owner))}</span>` : ""}
+      </div>`}
+    </div>`
 
-  return `
-            <div id="card-${
-              p.id
-            }" class="property-card bg-white rounded-2xl shadow-sm border border-gray-100 overflow-hidden relative group dark:bg-dark-800 dark:border-gray-700">
-                <div class="relative h-56">
-                    <img src="${
-                      p.imgUrl || "https://via.placeholder.com/500x300"
-                    }" class="w-full h-full object-cover transition duration-500 group-hover:scale-105" loading="lazy">
-                    <div class="absolute top-3 right-3 ${
-                      st.bg
-                    } px-3 py-1 rounded-full text-xs font-bold uppercase tracking-wide backdrop-blur-md shadow-sm">
-                        <i class="fa-solid ${st.icon} mr-1"></i> ${p.status}
-                    </div>
-                    
-                    ${
-                      canEdit
-                        ? `
-                    <div class="absolute bottom-3 right-3 flex gap-2 opacity-0 group-hover:opacity-100 transition-opacity duration-200">
-                         ${
-                           isOwner
-                             ? `<button onclick="openShareModal('${p.id}')" class="bg-blue-600 text-white w-9 h-9 rounded-full shadow-lg flex items-center justify-center hover:bg-blue-700 hover:scale-110 transition" title="Share Access"><i class="fa-solid fa-user-plus text-xs"></i></button>`
-                             : ""
-                         }
-                         
-                         <button onclick="openEditModal('${
-                           p.id
-                         }')" class="bg-white text-gray-800 w-9 h-9 rounded-full shadow-lg flex items-center justify-center hover:bg-gray-100 hover:scale-110 transition dark:bg-dark-700 dark:text-white" title="Edit Details"><i class="fa-solid fa-pen text-xs"></i></button>
-                    </div>`
-                        : ""
-                    }
-                </div>
-                
-                <div class="p-5">
-                    <div class="flex justify-between items-start mb-2">
-                        <div>
-                            <p class="text-xs font-bold text-indigo-600 uppercase tracking-wider dark:text-indigo-400">${
-                              p.propertyType
-                            } • ${p.operation}</p>
-                            <h3 class="text-lg font-bold text-gray-900 leading-tight truncate w-56 dark:text-white" title="${
-                              p.title
-                            }">${p.title}</h3>
-                        </div>
-                        <p class="text-xl font-bold text-gray-900 dark:text-white">${cur}${p.price.toLocaleString()}</p>
-                    </div>
-                    
-                    <div class="flex items-center text-gray-500 text-sm mb-4 dark:text-gray-400">
-                        <i class="fa-solid fa-location-dot mr-2 text-indigo-400"></i> ${
-                          p.city
-                        }, ${p.country}
-                    </div>
-
-                    ${
-                      canEdit
-                        ? `
-                    <div class="pt-4 border-t border-gray-100 dark:border-gray-700 flex justify-between gap-2">
-                         <button onclick="changeStatus('${p.id}', 'available')" class="flex-1 py-2 text-xs font-bold rounded bg-gray-50 hover:bg-green-50 text-gray-600 hover:text-green-700 dark:bg-dark-900 dark:text-gray-300 dark:hover:text-green-400 transition">Available</button>
-                         <button onclick="changeStatus('${p.id}', 'reserved')" class="flex-1 py-2 text-xs font-bold rounded bg-gray-50 hover:bg-yellow-50 text-gray-600 hover:text-yellow-700 dark:bg-dark-900 dark:text-gray-300 dark:hover:text-yellow-400 transition">Reserve</button>
-                         <button onclick="changeStatus('${p.id}', 'sold')" class="flex-1 py-2 text-xs font-bold rounded bg-gray-50 hover:bg-red-50 text-gray-600 hover:text-red-700 dark:bg-dark-900 dark:text-gray-300 dark:hover:text-red-400 transition">Sold</button>
-                    </div>`
-                        : `
-                    <div class="pt-4 border-t border-gray-100 dark:border-gray-700 flex justify-between items-center text-xs text-gray-400">
-                        <span><i class="fa-regular fa-clock mr-1"></i> ${new Date(
-                          p.createdAt
-                        ).toLocaleDateString()}</span>
-                        ${
-                          p.owner
-                            ? `<span class="font-mono bg-gray-100 px-2 py-0.5 rounded dark:bg-dark-900 text-gray-500" title="Owner">${p.owner.substr(
-                                0,
-                                6
-                              )}...</span>`
-                            : ""
-                        }
-                    </div>
-                    `
-                    }
-                </div>
-            </div>
-            `
+  card.querySelector("[data-share]")?.addEventListener("click", () => openShareModal(id))
+  card.querySelector("[data-edit]")?.addEventListener("click", () => openEditModal(id))
+  card.querySelector("[data-delete]")?.addEventListener("click", () => deleteListing(id))
+  card.querySelectorAll("[data-status-btn]").forEach((b) =>
+    b.addEventListener("click", () => changeStatus(id, b.dataset.statusBtn)))
+  return card
 }
 
-// --- ACTIONS: EDIT / STATUS / SHARE ---
+// ======================= Actions: status / share / delete =================
 
-// 1. Change Status (Atomic Update)
-window.changeStatus = async (id, newStatus) => {
+const changeStatus = async (id, newStatus) => {
   try {
     const { result: node } = await db.get(id)
     if (!node) return
-    const updatedData = { ...node.value, status: newStatus }
-    await db.sm.acls.set(updatedData, id) // Auto-checks permissions
-  } catch (e) {
-    alert("Permission denied. You are not an owner or collaborator.")
+    await db.sm.acls.set({ ...node.value, status: newStatus }, id) // ACL-checked
+  } catch {
+    toast("Permission denied — you are not an owner or collaborator", true)
   }
 }
 
-// 2. Open Edit Modal (Fill Form)
-window.openEditModal = async (id) => {
+const deleteListing = async (id) => {
+  if (!confirm("Delete this listing?")) return
+  try {
+    await db.sm.executeWithPermission("delete")
+    await db.remove(id)
+    toast("Listing deleted")
+  } catch (err) {
+    toast(err.message, true)
+  }
+}
+
+const openShareModal = (id) => {
+  $("share-node-id").value = id
+  $("share-address").value = ""
+  $("shareModal").showModal()
+}
+$("closeShareBtn").onclick = () => $("shareModal").close()
+$("shareModal").onclick = (e) => { if (e.target === $("shareModal")) $("shareModal").close() }
+
+$("confirmShareBtn").onclick = async () => {
+  const id = $("share-node-id").value
+  const addr = $("share-address").value.trim()
+  if (!addr.startsWith("0x")) return toast("Invalid ETH address", true)
+  try {
+    // 1. The real permission: grant write on this node via GenosDB ACLs.
+    await db.sm.acls.grant(id, addr, "write")
+    // 2. Mirror the grant into the node value so every peer's UI can show
+    //    edit affordances to the collaborator without an async ACL lookup.
+    const { result: node } = await db.get(id)
+    const collaborators = { ...(node.value.collaborators || {}), [addr]: "write" }
+    await db.sm.acls.set({ ...node.value, collaborators }, id)
+    toast(`Access granted to ${db.sm.abbrAddr(addr)}`)
+    $("shareModal").close()
+  } catch {
+    toast("Error granting access — only the owner can share", true)
+  }
+}
+
+// ============================ Publish / edit ===============================
+
+const openPublishModal = () => {
+  if (!db.sm.isSecurityActive()) return $("identityModal").showModal()
+  $("publish-form").reset()
+  $("edit-node-id").value = ""
+  $("modal-title").textContent = "Publish Property"
+  $("btn-submit-property").textContent = "Publish Property"
+  $("publishModal").showModal()
+}
+$("publishBtn").onclick = openPublishModal
+$("closePublishBtn").onclick = () => $("publishModal").close()
+
+const openEditModal = async (id) => {
   const { result: node } = await db.get(id)
   if (!node) return
   const p = node.value
-
-  // Fill fields
-  const f = document.getElementById("publish-form")
-  document.getElementById("edit-node-id").value = id
-  document.getElementById("modal-title").innerText = "Edit Property"
-  document.getElementById("btn-submit-property").innerText = "Save Changes"
-
-  f.querySelector("[name=title]").value = p.title || ""
-  f.querySelector("[name=operation]").value = p.operation || "sale"
-  f.querySelector("[name=propertyType]").value = p.propertyType || "apartment"
-  f.querySelector("[name=price]").value = p.price || ""
-  f.querySelector("[name=currency]").value = p.currency || "USD"
-  f.querySelector("[name=country]").value = p.country || ""
-  f.querySelector("[name=city]").value = p.city || ""
-  f.querySelector("[name=zone]").value = p.zone || ""
-  f.querySelector("[name=address]").value = p.address || ""
-  f.querySelector("[name=imgUrl]").value = p.imgUrl || ""
-  f.querySelector("[name=lat]").value = p.lat || ""
-  f.querySelector("[name=lng]").value = p.lng || ""
-
-  modalPublish.show()
-}
-
-// 3. Open Share Modal
-window.openShareModal = (id) => {
-  document.getElementById("share-node-id").value = id
-  document.getElementById("share-address").value = ""
-  modalShare.show()
-}
-
-// 4. Execute Share (Grant ACL)
-window.confirmShare = async () => {
-  const id = document.getElementById("share-node-id").value
-  const addr = document.getElementById("share-address").value.trim()
-
-  if (!addr.startsWith("0x")) return alert("Invalid ETH address")
-
-  try {
-    // 1. Grant Write Access via GenosDB ACLs
-    await db.sm.acls.grant(id, addr, "write")
-
-    // 2. Optional: Update the node value to include this collaborator
-    // This allows the UI to react immediately (showing Edit buttons to the collaborator)
-    // without waiting for a re-fetch of permissions.
-    const { result: node } = await db.get(id)
-    const currentCollaborators = node.value.collaborators || {}
-    currentCollaborators[addr] = "write"
-
-    const updatedData = { ...node.value, collaborators: currentCollaborators }
-    await db.sm.acls.set(updatedData, id)
-
-    alert(`Access granted to ${addr.substr(0, 6)}...`)
-    modalShare.hide()
-  } catch (e) {
-    console.error(e)
-    alert("Error granting access. Ensure you are the owner.")
+  const f = $("publish-form")
+  $("edit-node-id").value = id
+  $("modal-title").textContent = "Edit Property"
+  $("btn-submit-property").textContent = "Save Changes"
+  for (const name of ["title", "operation", "propertyType", "price", "currency", "country", "city", "zone", "address", "imgUrl", "lat", "lng"]) {
+    const field = f.querySelector(`[name=${name}]`)
+    if (field) field.value = p[name] ?? ""
   }
+  $("publishModal").showModal()
 }
 
-// --- PUBLISH / SAVE LOGIC ---
-window.openPublishModal = () => {
-  if (!db.sm.isSecurityActive()) return modalLogin.show()
-  // Reset form for new entry
-  document.getElementById("publish-form").reset()
-  document.getElementById("edit-node-id").value = ""
-  document.getElementById("modal-title").innerText = "Publish Property"
-  document.getElementById("btn-submit-property").innerText = "Publish Property"
-  modalPublish.show()
-}
-
-document
-  .getElementById("publish-form")
-  .addEventListener("submit", async (e) => {
-    e.preventDefault()
-    const fd = new FormData(e.target)
-    const currentUser = db.sm.getActiveEthAddress()
-    const editId = document.getElementById("edit-node-id").value // If present, we are editing
-
-    // Construct Data Object
-    const propertyData = {
-      type: "Property",
-      title: fd.get("title"),
-      operation: fd.get("operation"),
-      propertyType: fd.get("propertyType"),
-      price: Number(fd.get("price")),
-      currency: fd.get("currency"),
-      country: fd.get("country"),
-      city: fd.get("city"),
-      zone: fd.get("zone"),
-      address: fd.get("address"),
-      imgUrl: fd.get("imgUrl"),
-      lat: Number(fd.get("lat")),
-      lng: Number(fd.get("lng")),
-      // Preserve status/owner/date if editing, else default
-      createdAt: editId ? undefined : Date.now(),
-    }
-
-    try {
-      if (editId) {
-        // --- UPDATE FLOW ---
-        // Fetch original to preserve immutable fields (created date, original owner, collaborators)
-        const { result: oldNode } = await db.get(editId)
-
-        // Merge: Keep old meta, overwrite form data
-        const finalData = {
-          ...oldNode.value,
-          ...propertyData,
-          createdAt: oldNode.value.createdAt, // Ensure date doesn't change
-        }
-
-        await db.sm.acls.set(finalData, editId)
-      } else {
-        // --- CREATE FLOW ---
-        propertyData.owner = currentUser
-        propertyData.status = "available"
-        propertyData.collaborators = {} // Init empty map
-
-        await db.sm.acls.set(propertyData)
-      }
-
-      modalPublish.hide()
-      e.target.reset()
-    } catch (err) {
-      console.error(err)
-      alert("Error saving property. Permission denied?")
-    }
-  })
-
-// --- AUTH & UI HELPERS ---
-function updateAuthUI(state) {
-  const actions = document.getElementById("auth-actions")
-  const info = document.getElementById("user-info")
-
-  if (state.isActive) {
-    actions.classList.add("hidden")
-    info.classList.remove("hidden")
-    info.classList.add("flex")
-    document.getElementById("user-address").textContent = state.abbrAddr
-    // Refresh list to update edit button visibility based on new user
-    performSearch(false)
-  } else {
-    actions.classList.remove("hidden")
-    info.classList.add("hidden")
-    info.classList.remove("flex")
-    performSearch(false)
-  }
-}
-
-// Identity Functions (Standard SM Wrappers)
-window.generateIdentity = async () => {
-  const id = await db.sm.startNewUserRegistration()
-  if (id) {
-    document.getElementById("mnemonic-container").classList.remove("hidden")
-    document.getElementById("mnemonic-field").value = id.mnemonic
-    document.getElementById("btn-gen-id").classList.add("hidden")
-    document.getElementById("btn-protect-id").classList.remove("hidden")
-  }
-}
-window.protectIdentity = async () => {
-  try {
-    await db.sm.protectCurrentIdentityWithWebAuthn()
-    modalRegister.hide()
-  } catch (e) {
-    alert("Auth Error (HTTPS required)")
-  }
-}
-window.loginWebAuthn = async () => {
-  try {
-    if (await db.sm.loginCurrentUserWithWebAuthn()) modalLogin.hide()
-    else alert("No passkey found.")
-  } catch (e) {
-    console.error(e)
-  }
-}
-window.loginMnemonic = async () => {
-  const phrase = document.getElementById("login-mnemonic").value.trim()
-  if (await db.sm.loginOrRecoverUserWithMnemonic(phrase)) modalLogin.hide()
-  else alert("Invalid phrase")
-}
-window.logout = async () => {
-  await db.sm.clearSecurity()
-}
-window.getCurrentLocation = () =>
-  navigator.geolocation?.getCurrentPosition((p) => {
-    document.querySelector("[name=lat]").value = p.coords.latitude.toFixed(4)
-    document.querySelector("[name=lng]").value = p.coords.longitude.toFixed(4)
-  })
-window.loadMore = () => performSearch(true)
-document.getElementById("search-form").addEventListener("submit", (e) => {
+$("publish-form").addEventListener("submit", async (e) => {
   e.preventDefault()
-  performSearch(false)
+  const fd = new FormData(e.target)
+  const editId = $("edit-node-id").value
+
+  const propertyData = {
+    type: "Property",
+    title: fd.get("title"),
+    operation: fd.get("operation"),
+    propertyType: fd.get("propertyType"),
+    price: Number(fd.get("price")),
+    currency: fd.get("currency"),
+    country: fd.get("country"),
+    city: fd.get("city"),
+    zone: fd.get("zone"),
+    address: fd.get("address"),
+    imgUrl: fd.get("imgUrl"),
+    lat: Number(fd.get("lat")),
+    lng: Number(fd.get("lng")),
+  }
+
+  try {
+    await db.sm.executeWithPermission("write") // fail fast: guests can't publish
+
+    if (editId) {
+      // UPDATE: preserve immutable fields (creation date, owner, collaborators)
+      const { result: oldNode } = await db.get(editId)
+      await db.sm.acls.set({ ...oldNode.value, ...propertyData, createdAt: oldNode.value.createdAt }, editId)
+      toast("Property updated")
+    } else {
+      // CREATE: the ACL layer makes the caller the owner of the node
+      await db.sm.acls.set({ ...propertyData, owner: myAddress, status: "available", collaborators: {}, createdAt: Date.now() })
+      await bumpListingCount() // governance metric — rules read it from my user node
+      toast("Property published")
+    }
+    $("publishModal").close()
+    e.target.reset()
+  } catch (err) {
+    toast(err.message, true)
+  }
 })
 
-// Modals & View
-const toggle = (id, s) => {
-  const el = document.getElementById(id)
-  el.classList.toggle("hidden", !s)
-  el.classList.toggle("flex", s)
-}
-window.modalRegister = {
-  show: () => toggle("modal-register", 1),
-  hide: () => toggle("modal-register", 0),
-}
-window.modalLogin = {
-  show: () => toggle("modal-login", 1),
-  hide: () => toggle("modal-login", 0),
-}
-window.modalPublish = {
-  show: () => toggle("modal-publish", 1),
-  hide: () => toggle("modal-publish", 0),
-}
-window.modalShare = {
-  show: () => toggle("modal-share", 1),
-  hide: () => toggle("modal-share", 0),
+/** Aggregate the governance metric into my user node (spread to keep `role`!). */
+const bumpListingCount = async () => {
+  const id = `user:${myAddress}`
+  const { result } = await db.get(id)
+  await db.put({ ...result.value, listingCount: (result.value.listingCount ?? 0) + 1 }, id)
 }
 
-window.switchView = (v) => {
-  const list = document.getElementById("view-list")
-  const map = document.getElementById("view-map")
-  const bList = document.getElementById("tab-list")
-  const bMap = document.getElementById("tab-map")
+$("geoBtn").onclick = () =>
+  navigator.geolocation?.getCurrentPosition((pos) => {
+    document.querySelector("[name=lat]").value = pos.coords.latitude.toFixed(4)
+    document.querySelector("[name=lng]").value = pos.coords.longitude.toFixed(4)
+  })
 
-  if (v === "list") {
-    list.classList.remove("hidden")
-    map.classList.add("hidden")
-    bList.classList.add(
-      "border-indigo-600",
-      "text-indigo-600",
-      "dark:text-indigo-400",
-      "dark:border-indigo-400"
-    )
-    bList.classList.remove("border-transparent", "text-gray-500")
-    bMap.classList.remove(
-      "border-indigo-600",
-      "text-indigo-600",
-      "dark:text-indigo-400",
-      "dark:border-indigo-400"
-    )
-    bMap.classList.add("border-transparent", "text-gray-500")
-  } else {
-    list.classList.add("hidden")
-    map.classList.remove("hidden")
-    bMap.classList.add(
-      "border-indigo-600",
-      "text-indigo-600",
-      "dark:text-indigo-400",
-      "dark:border-indigo-400"
-    )
-    bMap.classList.remove("border-transparent", "text-gray-500")
-    bList.classList.remove(
-      "border-indigo-600",
-      "text-indigo-600",
-      "dark:text-indigo-400",
-      "dark:border-indigo-400"
-    )
-    bList.classList.add("border-transparent", "text-gray-500")
-    setTimeout(() => mapInstance.invalidateSize(), 100)
-  }
+// ============================ Views & wiring ===============================
+
+const switchView = (view) => {
+  $("view-list").style.display = view === "list" ? "block" : "none"
+  $("view-map").style.display = view === "map" ? "block" : "none"
+  $("tab-list").classList.toggle("active", view === "list")
+  $("tab-map").classList.toggle("active", view === "map")
+  if (view === "map") setTimeout(() => mapInstance.invalidateSize(), 100)
 }
+$("tab-list").onclick = () => switchView("list")
+$("tab-map").onclick = () => switchView("map")
 
-initApp()
+$("btn-load-more").onclick = () => performSearch(true)
+$("search-form").addEventListener("submit", (e) => { e.preventDefault(); performSearch(false) })
+
+addEventListener("beforeunload", () => db.room?.leave?.()) // real unload only — never pagehide
+
+// ================================= Boot ====================================
+
+applyTheme(localStorage.theme ?? (matchMedia("(prefers-color-scheme: light)").matches ? "light" : "dark"))
+applyPermissionsToUI()
+initMap()
+performSearch(false)
