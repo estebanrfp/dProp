@@ -235,16 +235,20 @@ const updateMapMarker = (p) => {
 // owns ordering (createdAt desc) and the cursor window ($limit/$after).
 
 let currentCursor = null
-let activeSubscription = null
+let subscriptions = [] // one per page window (Load more adds another)
+let searchGen = 0 // a fresh search supersedes any in-flight one (guards races)
 
 async function performSearch(isLoadMore = false) {
   if (!isLoadMore) {
+    searchGen++
     $("property-grid").innerHTML = ""
     currentCursor = null
-    activeSubscription?.()
+    subscriptions.forEach((unsub) => unsub())
+    subscriptions = []
     Object.values(mapMarkers).forEach((m) => mapInstance.removeLayer(m))
     mapMarkers = {}
   }
+  const gen = searchGen
 
   const fd = new FormData($("search-form"))
   const query = { type: "Property" }
@@ -261,7 +265,8 @@ async function performSearch(isLoadMore = false) {
     { query, realtime: true, $limit: 12, $after: currentCursor, order: "desc", field: "createdAt" },
     ({ id, value, action }) => handleRealtimeUpdate(id, value, action),
   )
-  activeSubscription = unsubscribe
+  if (gen !== searchGen) return unsubscribe() // superseded while awaiting — drop it
+  subscriptions.push(unsubscribe)
 
   $("results-count").textContent = `${results.length} properties found`
   $("btn-load-more").style.display = results.length < 12 ? "none" : "inline-block"
@@ -281,7 +286,8 @@ function handleRealtimeUpdate(id, value, action) {
       grid.appendChild(buildCard(id, value))
       break
     case "added": // a brand-new listing — newest by definition, enters on top
-      grid.prepend(buildCard(id, value))
+      if (existing) existing.replaceWith(buildCard(id, value)) // never duplicate
+      else grid.prepend(buildCard(id, value))
       break
     case "updated": { // edits and status changes rebuild the card in place
       const card = buildCard(id, value)
